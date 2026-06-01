@@ -1,0 +1,14 @@
+# secrets — never commit
+*.env
+!.env.example
+
+# deps / build
+node_modules
+dist
+
+# local runtime data (durable store + traces)
+research.db*
+logs/
+
+# os
+.DS_Store

@@ -1,0 +1,39 @@
+{
+  "name": "deep-research-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A from-scratch TypeScript terminal research agent on the OpenAI raw API: a hand-owned while-loop harness that spawns recursive sub-agents to search/read via Exa and synthesize cited answers.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Yospy <yashwadgave1008@gmail.com>",
+  "keywords": [
+    "ai-agent",
+    "deep-research",
+    "openai",
+    "exa",
+    "llm",
+    "typescript",
+    "cli"
+  ],
+  "engines": {
+    "node": ">=23"
+  },
+  "scripts": {
+    "dev": "tsx terminal.ts",
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.0",
+    "chalk": "^5.6.2",
+    "dotenv": "^17.0.0",
+    "log-update": "^8.0.0",
+    "zod": "^3.24.0",
+    "zod-to-json-schema": "^3.25.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.22.0",
+    "typescript": "^5.7.0"
+  }
+}
