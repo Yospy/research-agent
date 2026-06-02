@@ -1,8 +1,9 @@
-import { createInterface } from "node:readline/promises";
+import { createInterface, type Interface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import chalk from "chalk";
 import { openDb, createRun, createAgent, finishRun, listRuns } from "./src/agent/db.ts";
 import { runAgent } from "./src/agent/runAgent.ts";
+import { intake } from "./src/agent/intake.ts";
 import { ROOT_TOOLS } from "./src/agent/tools/registry.ts";
 import { createRenderer } from "./src/ui/render.ts";
 import { printHistory, printRun, printSources, printMetrics } from "./src/ui/history.ts";
@@ -59,13 +60,55 @@ function openRun(arg: string): void {
   }
 }
 
+// One listener on 'line' → an async queue. next() resolves the next line, or null once stdin closes.
+// Both the command loop AND the intake clarification step pull from this single queue, so no line is
+// ever double-consumed (the readline footgun when mixing the async iterator with reads).
+function makeLineReader(r: Interface) {
+  const buffer: string[] = [];
+  const waiters: ((line: string | null) => void)[] = [];
+  let closed = false;
+  r.on("line", (line) => {
+    const w = waiters.shift();
+    if (w) w(line);
+    else buffer.push(line);
+  });
+  r.on("close", () => {
+    closed = true;
+    for (const w of waiters.splice(0)) w(null);
+  });
+  return {
+    next(): Promise<string | null> {
+      if (buffer.length) return Promise.resolve(buffer.shift()!);
+      if (closed) return Promise.resolve(null);
+      return new Promise((resolve) => waiters.push(resolve));
+    },
+  };
+}
+
+// Renders each clarifying question and reads its answer from the same line queue.
+function makeAsker(r: Interface, lines: { next(): Promise<string | null> }) {
+  let asked = 0;
+  return async (question: string): Promise<string> => {
+    if (asked++ === 0) output.write(chalk.dim("\n  a few quick questions to focus the research:\n"));
+    output.write(chalk.magenta("  ? ") + question + "\n");
+    r.setPrompt(chalk.magenta("  › "));
+    r.prompt();
+    const ans = await lines.next();
+    r.setPrompt("prompt> ");
+    return ans ?? "";
+  };
+}
+
 const rl = createInterface({ input, output, prompt: "prompt> " });
 rl.on("SIGINT", () => rl.close());
+const lines = makeLineReader(rl);
 
 console.log(chalk.bold("deep-research-agent") + " — ask a question, or /help");
 rl.prompt();
 
-for await (const line of rl) {
+for (;;) {
+  const line = await lines.next();
+  if (line === null) break; // stdin closed (EOF / Ctrl-D / SIGINT)
   const q = line.trim();
   if (q === "") {
     rl.prompt();
@@ -75,7 +118,11 @@ for await (const line of rl) {
   if (q === "/help") console.log(HELP);
   else if (q === "/history") printHistory(db);
   else if (q.startsWith("/open ")) openRun(q.slice("/open ".length).trim());
-  else await runQuestion(q);
+  else {
+    // Intake STATE: deterministically clarify an ambiguous topic before research starts.
+    const brief = await intake(q, { ask: makeAsker(rl, lines) });
+    await runQuestion(brief);
+  }
   rl.prompt();
 }
 
