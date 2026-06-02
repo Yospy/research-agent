@@ -13,6 +13,7 @@ const db = openDb("research.db");
 
 const HELP = `commands:
   <question>      run a new research run
+  /new            start a new thread (the next topic gets clarified again)
   /history        list past runs
   /open <n|id>    reprint a past run (n = number from /history)
   /help           show this
@@ -102,6 +103,7 @@ function makeAsker(r: Interface, lines: { next(): Promise<string | null> }) {
 const rl = createInterface({ input, output, prompt: "prompt> " });
 rl.on("SIGINT", () => rl.close());
 const lines = makeLineReader(rl);
+let clarified = false; // intake runs ONCE per thread — only the first topic gets clarified
 
 console.log(chalk.bold("deep-research-agent") + " — ask a question, or /help");
 rl.prompt();
@@ -116,11 +118,15 @@ for (;;) {
   }
   if (q === "/exit") break;
   if (q === "/help") console.log(HELP);
-  else if (q === "/history") printHistory(db);
+  else if (q === "/new") {
+    clarified = false;
+    console.log(chalk.dim("  new thread — your next topic will be clarified"));
+  } else if (q === "/history") printHistory(db);
   else if (q.startsWith("/open ")) openRun(q.slice("/open ".length).trim());
   else {
-    // Intake STATE: deterministically clarify an ambiguous topic before research starts.
-    const brief = await intake(q, { ask: makeAsker(rl, lines) });
+    // Intake STATE: clarify only the FIRST topic of a thread; later prompts go straight to research.
+    const brief = clarified ? q : await intake(q, { ask: makeAsker(rl, lines) });
+    clarified = true;
     await runQuestion(brief);
   }
   rl.prompt();
