@@ -53,6 +53,7 @@ export interface AgentCtx {
   toolBudget: number;
   citations: Map<string, Citation>; // keyed by url, deduped, harness-owned
   onEvent?: (e: AgentEvent) => void; // optional live sink (UI subscribes); threads to children
+  deadline?: number; // optional epoch-ms wall-clock cap; the loop fails closed past it
 }
 
 // Trace events the harness emits at each seam → sinks (db, logs/, ui later).

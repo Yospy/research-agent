@@ -58,6 +58,11 @@ export async function runAgent(
 
   let calls = 0;
   while (true) {
+    // Root deadline (wall-clock cap): fail closed before spending another LLM turn.
+    if (ctx.deadline && Date.now() > ctx.deadline) {
+      trace.log({ agent: ctx.agentId, event: "agent_result", ok: false, error: "deadline" });
+      return finish({ ok: false, error: "deadline" });
+    }
     const res = await streamLLM(messages, toolDefs.length ? toolDefs : undefined, onText);
     const choice = res.choices[0]!;
     const cached = res.usage.prompt_tokens_details?.cached_tokens ?? 0;
