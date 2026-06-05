@@ -6,6 +6,9 @@
 node_modules
 dist
 
+# go orchestrator build artifact (binary named after the dir)
+orchestrator/orchestrator
+
 # local runtime data (durable store + traces)
 research.db*
 logs/
