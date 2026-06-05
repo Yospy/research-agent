@@ -7,9 +7,14 @@ import { intake } from "./src/agent/intake.ts";
 import { ROOT_TOOLS } from "./src/agent/tools/registry.ts";
 import { createRenderer } from "./src/ui/render.ts";
 import { printHistory, printRun, printSources, printMetrics } from "./src/ui/history.ts";
+import { startWorkerServer } from "./src/worker/server.ts";
+import { WORKER_PORT, ROOT_DEADLINE_MS } from "./src/agent/config.ts";
 import type { AgentCtx, Citation } from "./src/agent/types.ts";
 
 const db = openDb("research.db");
+// In-process worker endpoint: the Go orchestrator calls back here to run sub-agents. Sharing
+// this process keeps one SQLite writer; the event loop serves /run while the root awaits.
+const worker = startWorkerServer(db, WORKER_PORT);
 
 const HELP = `commands:
   <question>      run a new research run
@@ -34,6 +39,7 @@ async function runQuestion(question: string): Promise<void> {
     toolBudget: 12,
     citations,
     onEvent: renderer.handle,
+    deadline: Date.now() + ROOT_DEADLINE_MS, // wall-clock cap for the whole root run
   };
 
   const result = await runAgent(question, ROOT_TOOLS, ctx);
@@ -133,5 +139,6 @@ for (;;) {
 }
 
 rl.close();
+worker.close();
 db.close();
 process.exit(0);

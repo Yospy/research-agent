@@ -1,69 +1,94 @@
 import { z } from "zod";
-import { createAgent } from "../db.ts";
-import { createTrace } from "../events.ts";
 import { mergeCitations } from "../citations.ts";
-import { runAgent } from "../runAgent.ts";
-import { CHILD_TOOLS } from "./registry.ts";
-import type { AgentCtx, Tool } from "../types.ts";
+import { ORCHESTRATOR_URL, ORCHESTRATOR_POLICY } from "../config.ts";
+import type { Citation, Tool } from "../types.ts";
 
-const schema = z.object({ sub_question: z.string() });
+const schema = z.object({ sub_questions: z.string().min(1).array().min(1) });
 
-// The orchestration tool. Its run() recurses into the SAME runAgent one level deeper, with a fresh
-// isolated context and a narrowed toolset (CHILD_TOOLS, no spawn → bounded). Returns a compressed
-// {summary, citations} — the parent never sees the child's page dumps (context isolation).
-export const spawnResearcher: Tool<z.infer<typeof schema>, { summary: string; citations: string[] }> = {
+// One per input sub-question, in input order (mirrors the Go PerTaskResult).
+interface PerTaskResult {
+  ok: boolean;
+  agentId?: string;
+  summary?: string;
+  citations?: Citation[];
+  error?: { message: string; retryable: boolean };
+}
+
+type SpawnResult = { results: PerTaskResult[] };
+
+// The orchestration tool. No longer recurses in-process: it RPCs the Go orchestrator with a
+// BATCH of sub-questions. The orchestrator fans out (bounded concurrency, per-task timeout,
+// one silent retry on transport failure) to our in-process worker and returns one
+// {summary, citations} | {error} per question, in order. The harness JSON.stringifies the
+// return, so any per-task error becomes natural self-feedback for the model to retry with new args.
+export const spawnResearcher: Tool<z.infer<typeof schema>, SpawnResult> = {
   name: "spawn_researcher",
   description:
-    "Delegate a focused sub-question to an isolated researcher sub-agent. It searches and reads on " +
-    "its own and returns a compressed {summary, citations}. Use it for independent threads of the question.",
+    "Delegate one or more focused sub-questions to isolated researcher sub-agents that run " +
+    "concurrently. Each searches and reads on its own and returns a compressed {summary, " +
+    "citations}. Pass independent threads of the question as separate sub_questions.",
   schema,
   run: async (args, ctx) => {
-    // Bounded recursion: explicit depth cap (CHILD_TOOLS already lacks spawn — belt-and-suspenders).
+    const failAll = (message: string, retryable: boolean): SpawnResult => ({
+      results: args.sub_questions.map(() => ({ ok: false, error: { message, retryable } })),
+    });
+
+    // Bounded recursion: children run at depth+1 with CHILD_TOOLS (no spawn). Guard the cap here.
     if (ctx.depth + 1 > ctx.maxDepth) {
-      return { summary: "(sub-agent not spawned: max research depth reached)", citations: [] };
+      return failAll("max research depth reached", false);
     }
 
-    const childId = createAgent(ctx.db, {
-      runId: ctx.runId,
-      parentAgentId: ctx.agentId,
-      depth: ctx.depth + 1,
-      subQuestion: args.sub_question,
-    });
-    createTrace(ctx.runId).log({
-      agent: ctx.agentId,
-      event: "spawn",
-      child: childId,
-      sub_question: args.sub_question,
-      depth: ctx.depth + 1,
-    });
-    ctx.onEvent?.({
-      kind: "spawned",
-      agentId: ctx.agentId,
-      child: childId,
-      sub_question: args.sub_question,
-      depth: ctx.depth + 1,
-    });
+    // Make the root wall-clock deadline binding during the fan-out (the loop only re-checks it
+    // between turns). Aborting the fetch cancels the orchestrator via its request context.
+    const signal = ctx.deadline ? AbortSignal.timeout(Math.max(0, ctx.deadline - Date.now())) : undefined;
 
-    // Fresh, isolated child context: own agentId, own citation map, fresh budget, depth+1.
-    // onEvent threads through so child events reach the same UI renderer.
-    const childCtx: AgentCtx = {
-      db: ctx.db,
-      runId: ctx.runId,
-      agentId: childId,
-      parentAgentId: ctx.agentId,
-      depth: ctx.depth + 1,
-      maxDepth: ctx.maxDepth,
-      toolBudget: ctx.toolBudget,
-      citations: new Map(),
-      onEvent: ctx.onEvent,
-    };
-
-    const result = await runAgent(args.sub_question, CHILD_TOOLS, childCtx);
-    if (!result.ok) {
-      return { summary: `(sub-agent failed: ${result.error})`, citations: [] };
+    let data: SpawnResult;
+    try {
+      const resp = await fetch(`${ORCHESTRATOR_URL}/orchestrate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        signal,
+        body: JSON.stringify({
+          kind: "researcher",
+          tasks: args.sub_questions,
+          policy: ORCHESTRATOR_POLICY,
+          context: {
+            runId: ctx.runId,
+            parentAgentId: ctx.agentId,
+            depth: ctx.depth,
+            maxDepth: ctx.maxDepth,
+            toolBudget: ctx.toolBudget,
+          },
+        }),
+      });
+      if (!resp.ok) {
+        // callTool has no try/catch around run() — never throw; return structured feedback.
+        return failAll(`orchestrator ${resp.status}: ${await resp.text()}`, true);
+      }
+      data = (await resp.json()) as SpawnResult;
+    } catch (e) {
+      return failAll(`orchestrator unreachable: ${String(e)}`, true);
     }
 
-    mergeCitations(ctx, childCtx.citations); // bubble child's {title,url} up into the parent
-    return { summary: result.answer, citations: result.citations };
+    // Reflect each child into the UI tree (final status — Phase 1 isn't live) and bubble its
+    // citations up into the parent's authoritative map so the renderer can link [n].
+    data.results.forEach((r, i) => {
+      const sub = args.sub_questions[i] ?? "";
+      if (r.agentId) {
+        ctx.onEvent?.({ kind: "spawned", agentId: ctx.agentId, child: r.agentId, sub_question: sub, depth: ctx.depth + 1 });
+        ctx.onEvent?.({ kind: "agent_start", agentId: r.agentId, depth: ctx.depth + 1, sub_question: sub });
+        const result = r.ok
+          ? { ok: true as const, answer: r.summary ?? "", citations: (r.citations ?? []).map((c) => c.url) }
+          : { ok: false as const, error: r.error?.message ?? "unknown error" };
+        ctx.onEvent?.({ kind: "result", agentId: r.agentId, result });
+      }
+      if (r.citations?.length) {
+        const map = new Map<string, Citation>();
+        for (const c of r.citations) map.set(c.url, c);
+        mergeCitations(ctx, map);
+      }
+    });
+
+    return data;
   },
 };
