@@ -66,6 +66,7 @@ export async function streamLLM(
   messages: Msg[],
   tools?: ChatTool[],
   onText?: (delta: string) => void,
+  signal?: AbortSignal,
 ): Promise<ChatResponse> {
   const body = {
     model: MODEL,
@@ -79,6 +80,7 @@ export async function streamLLM(
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_API_KEY}` },
     body: JSON.stringify(body),
+    signal,
   });
   if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${await res.text()}`);
   if (!res.body) throw new Error("LLM stream: no response body");

@@ -50,20 +50,25 @@ export async function runAgent(
     insertMessage(ctx.db, { agentId: ctx.agentId, seq: seq++, role: m.role, contentJson: JSON.stringify(m) });
   }
 
-  // Stream the answer token-by-token, but only for the ROOT agent — children's text is internal.
-  const onText =
-    ctx.depth === 0
-      ? (text: string) => ctx.onEvent?.({ kind: "thinking", agentId: ctx.agentId, text })
-      : undefined;
+  // Stream text deltas as `thinking` events wherever there's a sink. For the root these drive the
+  // live UI; for a sub-agent (worker) they double as liveness pings to the orchestrator.
+  const onText = ctx.onEvent
+    ? (text: string) => ctx.onEvent?.({ kind: "thinking", agentId: ctx.agentId, text })
+    : undefined;
 
   let calls = 0;
   while (true) {
+    // Cancellation (idle/absolute timeout upstream): fail closed before spending another LLM turn.
+    if (ctx.signal?.aborted) {
+      trace.log({ agent: ctx.agentId, event: "agent_result", ok: false, error: "cancelled" });
+      return finish({ ok: false, error: "cancelled" });
+    }
     // Root deadline (wall-clock cap): fail closed before spending another LLM turn.
     if (ctx.deadline && Date.now() > ctx.deadline) {
       trace.log({ agent: ctx.agentId, event: "agent_result", ok: false, error: "deadline" });
       return finish({ ok: false, error: "deadline" });
     }
-    const res = await streamLLM(messages, toolDefs.length ? toolDefs : undefined, onText);
+    const res = await streamLLM(messages, toolDefs.length ? toolDefs : undefined, onText, ctx.signal);
     const choice = res.choices[0]!;
     const cached = res.usage.prompt_tokens_details?.cached_tokens ?? 0;
 

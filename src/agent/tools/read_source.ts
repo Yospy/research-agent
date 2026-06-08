@@ -11,7 +11,7 @@ export const readSource: Tool<z.infer<typeof schema>, SourceContent> = {
   description: "Read the full cleaned text of a source by its id or url. Returns {title,url,text}.",
   schema,
   run: async (args, ctx) => {
-    const content = await contents(ctx.db, args.id_or_url);
+    const content = await contents(ctx.db, args.id_or_url, ctx.signal);
     addCitation(ctx, { title: content.title, url: content.url });
     return content;
   },
