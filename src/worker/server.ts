@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { runResearcher, type RunResearcherContext } from "./runResearcher.ts";
+import type { AgentEvent } from "../agent/types.ts";
 import type { DB } from "../agent/db.ts";
 
 interface RunBody {
@@ -24,23 +25,69 @@ function readJson(req: IncomingMessage): Promise<unknown> {
   });
 }
 
-// Starts the in-process worker. It lives in the SAME Node process as the REPL/root agent, so
-// it shares the one SQLite connection (single writer) and the event loop serves /run requests
-// while the root awaits the orchestrator. The Go orchestrator calls back here, one POST /run
-// per sub-question.
+// Handles POST /run as an NDJSON stream: zero or more {"type":"event"} progress lines (pings),
+// then one {"type":"result"} line. Headers are flushed up front so the orchestrator's idle timer
+// starts immediately; if the orchestrator cancels (idle/absolute timeout), the connection closes
+// and we abort the in-flight work so it stops burning tokens.
+async function handleRun(db: DB, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let body: RunBody;
+  try {
+    body = (await readJson(req)) as RunBody;
+  } catch (e) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: String(e) }));
+    return;
+  }
+
+  res.writeHead(200, { "content-type": "application/x-ndjson" });
+  res.flushHeaders(); // headers out NOW → orchestrator's idle clock starts at t=0
+
+  let finished = false;
+  const write = (obj: unknown): void => {
+    if (finished || res.writableEnded || res.destroyed) return;
+    try {
+      res.write(JSON.stringify(obj) + "\n");
+    } catch {
+      // connection went away mid-write — the abort below will stop the work
+    }
+  };
+
+  // Orchestrator disconnect (cancel) before we finish → abort the researcher.
+  const ac = new AbortController();
+  res.on("close", () => {
+    if (!finished) ac.abort();
+  });
+
+  // Forward progress as pings. Structural events pass through; throttle token-level `thinking`
+  // to ~1/sec so a long answer stream keeps the task "alive" without flooding the wire.
+  let lastThinking = 0;
+  const onEvent = (e: AgentEvent): void => {
+    if (e.kind === "thinking") {
+      const now = Date.now();
+      if (now - lastThinking < 1000) return;
+      lastThinking = now;
+    }
+    write({ type: "event", event: e });
+  };
+
+  try {
+    const result = await runResearcher(db, body.kind, body.task, body.context, onEvent, ac.signal);
+    write({ type: "result", result });
+  } catch (e) {
+    write({ type: "result", result: { ok: false, error: String(e), retryable: true, citations: [] } });
+  } finally {
+    finished = true;
+    if (!res.writableEnded) res.end();
+  }
+}
+
+// Starts the in-process worker. It lives in the SAME Node process as the REPL/root agent, so it
+// shares the one SQLite connection (single writer) and the event loop serves /run requests while
+// the root awaits the orchestrator. The Go orchestrator calls back here, one POST /run per task.
 export function startWorkerServer(db: DB, port: number): Server {
-  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     if (req.method === "POST" && req.url === "/run") {
-      try {
-        const body = (await readJson(req)) as RunBody;
-        const result = await runResearcher(db, body.kind, body.task, body.context);
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(result));
-      } catch (e) {
-        // Worker-level crash → surface as a retryable transport failure to the orchestrator.
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: String(e), retryable: true, citations: [] }));
-      }
+      void handleRun(db, req, res);
       return;
     }
     if (req.method === "GET" && req.url === "/healthz") {

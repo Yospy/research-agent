@@ -24,7 +24,7 @@ function cacheKey(kind: string, input: string): string {
 }
 
 // Layer-2 cache (SQLite) checked BEFORE every network call; written after. Per context/06.
-export async function search(db: DB, query: string, numResults = 5): Promise<SearchResult[]> {
+export async function search(db: DB, query: string, numResults = 5, signal?: AbortSignal): Promise<SearchResult[]> {
   const key = cacheKey("search", `${query}|${numResults}`);
   const cached = exaCacheGet(db, key) as SearchResult[] | null;
   if (cached) return cached;
@@ -34,6 +34,7 @@ export async function search(db: DB, query: string, numResults = 5): Promise<Sea
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": EXA_API_KEY },
     body: JSON.stringify(reqBody),
+    signal,
   });
   if (!res.ok) throw new Error(`Exa search HTTP ${res.status}: ${await res.text()}`);
 
@@ -56,7 +57,7 @@ export async function search(db: DB, query: string, numResults = 5): Promise<Sea
   return results;
 }
 
-export async function contents(db: DB, idOrUrl: string): Promise<SourceContent> {
+export async function contents(db: DB, idOrUrl: string, signal?: AbortSignal): Promise<SourceContent> {
   const key = cacheKey("contents", idOrUrl);
   const cached = exaCacheGet(db, key) as SourceContent | null;
   if (cached) return cached;
@@ -67,6 +68,7 @@ export async function contents(db: DB, idOrUrl: string): Promise<SourceContent> 
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": EXA_API_KEY },
     body: JSON.stringify(reqBody),
+    signal,
   });
   if (!res.ok) throw new Error(`Exa contents HTTP ${res.status}: ${await res.text()}`);
 

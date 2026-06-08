@@ -17,7 +17,7 @@ export const webSearch: Tool<z.infer<typeof schema>, { results: SearchResult[] }
     "Call read_source on a result's url or id to read its full text.",
   schema,
   run: async (args, ctx) => {
-    const results = await search(ctx.db, args.query, args.num_results ?? 5);
+    const results = await search(ctx.db, args.query, args.num_results ?? 5, ctx.signal);
     return {
       results: results.map((r) => ({ ...r, snippet: r.snippet.slice(0, MAX_SNIPPET) })),
     };
