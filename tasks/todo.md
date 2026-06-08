@@ -64,3 +64,21 @@ logs per request + per task) — no behavior change:
   `speedup` (concurrency gain, bounded by cap and slowest task), `cap`, `slowest`.
 Verified via fake-worker demo: 5 tasks / cap 3 → wall=4.0s serial≈10.1s speedup=2.50x. go test still 6/6.
 Note: the speedup measures CONCURRENCY (parallel vs sequential), not Go-vs-TS — sub-agents still run in TS.
+
+## Phase 2: heartbeat + idle-timeout + cancellation (DONE)
+Worker streams NDJSON progress pings; orchestrator resets an idle timer per ping with an absolute
+backstop; cancellation threads an AbortSignal down so cut tasks actually stop.
+- worker `/run`: streams `{"type":"event"}` pings then `{"type":"result"}`; flushes headers at t=0;
+  aborts on orchestrator disconnect; throttles token-level `thinking` to ~1/sec.
+- orchestrator `runOneStreaming`: idle timer (reset per line) + absolute per-attempt ctx; pings logged.
+- AbortSignal threaded: runResearcher → runAgent (loop-top abort check, signal→streamLLM) →
+  web_search/read_source → exa search/contents fetches.
+- config: `ORCH_IDLE_TIMEOUT_MS` (60s), `perTaskTimeoutMs` default raised to 300s (absolute backstop).
+- timeout semantics now: pinging task stays alive past idle; silent → idle-killed; busy-forever → absolute.
+
+Subagent review: found 1 CRITICAL — scanner goroutine could park forever on the unbuffered send when
+the loop returns on idle/cancel (goroutine + 8MB buffer + fd leak, on the *expected* cancel path).
+Fixed with a `done` channel guarding the send (`defer close(done)`); added TestNoGoroutineLeakOnCancel
+(hammers 200 cancelled tasks, asserts no goroutine growth). Other invariants verified clean.
+Verified: go vet + gofmt clean; `go test -race` 8/8 pass; `npm run build` clean; live demo —
+pinging task survived 4.8s under a 2s idle window while a silent task was idle-killed at 2.0s.

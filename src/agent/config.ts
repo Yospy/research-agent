@@ -25,8 +25,12 @@ export const WORKER_PORT = Number(process.env.WORKER_PORT ?? "8788");
 export const ROOT_DEADLINE_MS = Number(process.env.ROOT_DEADLINE_MS ?? "300000");
 
 // Default orchestration policy sent with each fan-out (the deterministic control surface).
+// Phase 2: a task stays alive as long as it keeps emitting progress pings (idleTimeoutMs is the
+// max silence between pings); perTaskTimeoutMs is the absolute per-attempt backstop that catches
+// a busy-but-never-finishing task. A healthy slow task is bounded only by the absolute backstop.
 export const ORCHESTRATOR_POLICY = {
   maxConcurrency: Number(process.env.ORCH_MAX_CONCURRENCY ?? "3"),
-  perTaskTimeoutMs: Number(process.env.ORCH_PER_TASK_TIMEOUT_MS ?? "90000"),
+  perTaskTimeoutMs: Number(process.env.ORCH_PER_TASK_TIMEOUT_MS ?? "300000"), // absolute backstop (5 min)
+  idleTimeoutMs: Number(process.env.ORCH_IDLE_TIMEOUT_MS ?? "60000"), // kill on this much silence
   retryBudget: Number(process.env.ORCH_RETRY_BUDGET ?? "1"),
 };

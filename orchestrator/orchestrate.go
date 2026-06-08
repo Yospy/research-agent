@@ -4,13 +4,19 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
 
+// Opt-in: log every progress ping (with its event kind) as it arrives. Off by default so normal
+// runs stay readable; set ORCH_LOG_PINGS=1 to watch the stream live.
+var logPings = os.Getenv("ORCH_LOG_PINGS") != ""
+
 const (
 	defaultMaxConcurrency   = 3
-	defaultPerTaskTimeoutMs = 90000
+	defaultPerTaskTimeoutMs = 300000 // absolute per-attempt backstop (5 min)
+	defaultIdleTimeoutMs    = 60000  // max silence between progress pings
 	defaultRetryBudget      = 1
 )
 
@@ -20,6 +26,7 @@ func applyPolicyDefaults(p *Policy) Policy {
 	out := Policy{
 		MaxConcurrency:   defaultMaxConcurrency,
 		PerTaskTimeoutMs: defaultPerTaskTimeoutMs,
+		IdleTimeoutMs:    defaultIdleTimeoutMs,
 		RetryBudget:      defaultRetryBudget,
 	}
 	if p != nil {
@@ -28,6 +35,9 @@ func applyPolicyDefaults(p *Policy) Policy {
 		}
 		if p.PerTaskTimeoutMs > 0 {
 			out.PerTaskTimeoutMs = p.PerTaskTimeoutMs
+		}
+		if p.IdleTimeoutMs > 0 {
+			out.IdleTimeoutMs = p.IdleTimeoutMs
 		}
 		if p.RetryBudget >= 0 {
 			out.RetryBudget = p.RetryBudget
@@ -46,8 +56,8 @@ func Orchestrate(parent context.Context, client *http.Client, workerURL string, 
 	results := make([]PerTaskResult, n)
 	durations := make([]time.Duration, n) // each task's own wall time (disjoint indices → no lock)
 
-	log.Printf("/orchestrate kind=%s tasks=%d policy={conc:%d timeout:%dms retry:%d}",
-		req.Kind, n, policy.MaxConcurrency, policy.PerTaskTimeoutMs, policy.RetryBudget)
+	log.Printf("/orchestrate kind=%s tasks=%d policy={conc:%d idle:%dms maxTask:%dms retry:%d}",
+		req.Kind, n, policy.MaxConcurrency, policy.IdleTimeoutMs, policy.PerTaskTimeoutMs, policy.RetryBudget)
 
 	start := time.Now()
 	sem := make(chan struct{}, policy.MaxConcurrency) // bounded concurrency
@@ -62,14 +72,15 @@ func Orchestrate(parent context.Context, client *http.Client, workerURL string, 
 
 			t0 := time.Now()
 			log.Printf("  task[%d] → worker (slot acquired)", i)
-			results[i] = runTaskWithRetry(parent, client, workerURL, req.Kind, task, req.Context, policy, i)
+			pings := 0
+			results[i] = runTaskWithRetry(parent, client, workerURL, req.Kind, task, req.Context, policy, i, &pings)
 			durations[i] = time.Since(t0)
 
 			if results[i].OK {
-				log.Printf("  task[%d] ✓ ok   agent=%s (%.1fs)", i, short(results[i].AgentID), durations[i].Seconds())
+				log.Printf("  task[%d] ✓ ok   agent=%s (%.1fs, %d pings)", i, short(results[i].AgentID), durations[i].Seconds(), pings)
 			} else {
-				log.Printf("  task[%d] ✗ fail retryable=%v (%.1fs): %s",
-					i, results[i].Error.Retryable, durations[i].Seconds(), results[i].Error.Message)
+				log.Printf("  task[%d] ✗ fail retryable=%v (%.1fs, %d pings): %s",
+					i, results[i].Error.Retryable, durations[i].Seconds(), pings, results[i].Error.Message)
 			}
 		}(i, task)
 	}
@@ -111,16 +122,24 @@ func short(id string) string {
 // (semantic) returns immediately — success or failure, never retried. A transport failure
 // is retried up to RetryBudget times; if all attempts fail, it surfaces as a retryable error
 // so the model can decide to try again with new args.
-func runTaskWithRetry(parent context.Context, client *http.Client, workerURL, kind, task string, pass PassContext, policy Policy, idx int) PerTaskResult {
+func runTaskWithRetry(parent context.Context, client *http.Client, workerURL, kind, task string, pass PassContext, policy Policy, idx int, pings *int) PerTaskResult {
 	attempts := policy.RetryBudget + 1 // initial attempt + retries
+	idle := time.Duration(policy.IdleTimeoutMs) * time.Millisecond
 	var lastErr error
 
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
-			log.Printf("  task[%d] ⟳ retry %d/%d (transport: %v)", idx, attempt, policy.RetryBudget, lastErr)
+			log.Printf("  task[%d] ⟳ retry %d/%d (%v)", idx, attempt, policy.RetryBudget, lastErr)
 		}
+		// Per-attempt absolute backstop; the idle timeout (inside runOneStreaming) cuts sooner
+		// if the task goes silent.
 		taskCtx, cancel := context.WithTimeout(parent, time.Duration(policy.PerTaskTimeoutMs)*time.Millisecond)
-		wr, err := runOne(taskCtx, client, workerURL, kind, task, pass)
+		wr, err := runOneStreaming(taskCtx, client, workerURL, kind, task, pass, idle, func(evKind string) {
+			(*pings)++
+			if logPings {
+				log.Printf("  task[%d] · ping %d (%s)", idx, *pings, evKind)
+			}
+		})
 		cancel()
 
 		if err == nil {
@@ -135,13 +154,13 @@ func runTaskWithRetry(parent context.Context, client *http.Client, workerURL, ki
 			}
 		}
 
-		// Transport failure → eligible for another attempt.
+		// No verdict (transport / idle timeout / cancel) → eligible for another attempt.
 		lastErr = err
 	}
 
-	msg := "worker unreachable"
+	msg := "worker failed"
 	if lastErr != nil {
-		msg = "worker unreachable: " + lastErr.Error()
+		msg = lastErr.Error()
 	}
 	return PerTaskResult{OK: false, Error: &ErrorBody{Message: msg, Retryable: true}}
 }

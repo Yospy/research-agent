@@ -5,9 +5,12 @@ package main
 
 // Policy is the deterministic control surface. Zero/absent fields fall back to defaults
 // (see applyPolicyDefaults) so the tool can send a partial or no policy.
+//   - IdleTimeoutMs : max silence between progress pings before a task is judged hung (Phase 2).
+//   - PerTaskTimeoutMs : absolute per-attempt backstop (catches busy-but-never-finishing).
 type Policy struct {
 	MaxConcurrency   int `json:"maxConcurrency"`
 	PerTaskTimeoutMs int `json:"perTaskTimeoutMs"`
+	IdleTimeoutMs    int `json:"idleTimeoutMs"`
 	RetryBudget      int `json:"retryBudget"`
 }
 
@@ -43,7 +46,7 @@ type WorkerRequest struct {
 
 // WorkerResponse mirrors the TS AgentResult: a decoded reply is a *semantic* verdict
 // (the agent ran and decided), regardless of ok/!ok. Only a missing/undecodable reply
-// counts as a transport failure (see runOne).
+// counts as a transport failure (see runOneStreaming).
 type WorkerResponse struct {
 	OK        bool       `json:"ok"`
 	AgentID   string     `json:"agentId"`
